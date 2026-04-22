@@ -208,6 +208,92 @@ async function startServer() {
     }
   });
 
+  const defaultReviews = [
+    {
+      id: 'default-review-1',
+      name: 'Emily R.',
+      quote:
+        'I walked in with shoulder pain and left feeling light, aligned, and deeply relaxed. The treatment was professional and truly tailored to me.',
+      location: 'London',
+      rating: 5,
+    },
+    {
+      id: 'default-review-2',
+      name: 'James T.',
+      quote:
+        'Best sports massage I have had in years. Recovery after training is much faster and the tension in my lower back is finally under control.',
+      location: 'Canary Wharf',
+      rating: 5,
+    },
+    {
+      id: 'default-review-3',
+      name: 'Sofia M.',
+      quote:
+        'Calm environment, excellent communication, and results from the first session. I now book monthly as part of my routine.',
+      location: 'Shoreditch',
+      rating: 5,
+    },
+  ];
+
+  const sanitizeReviews = (input: any): any[] => {
+    if (!Array.isArray(input)) return [];
+
+    return input
+      .map((item: any, index: number) => {
+        const rating = Math.max(1, Math.min(5, Number(item?.rating) || 5));
+        return {
+          id: String(item?.id || `review-${Date.now()}-${index}`),
+          name: String(item?.name || '').trim(),
+          quote: String(item?.quote || '').trim(),
+          location: String(item?.location || '').trim(),
+          rating,
+        };
+      })
+      .filter((item) => item.name && item.quote);
+  };
+
+  app.get('/api/reviews', async (_req, res) => {
+    try {
+      const { data, error } = await supabase.from('settings').select('value').eq('key', 'home_reviews').maybeSingle();
+
+      if (error) {
+        if (error.code === '42P01') return res.json(defaultReviews);
+        throw error;
+      }
+
+      if (!data?.value) return res.json(defaultReviews);
+
+      let parsed = data.value;
+      if (typeof parsed === 'string') {
+        try {
+          parsed = JSON.parse(parsed);
+        } catch {
+          parsed = [];
+        }
+      }
+
+      const reviews = sanitizeReviews(parsed);
+      res.json(reviews.length > 0 ? reviews : defaultReviews);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Failed to load reviews.' });
+    }
+  });
+
+  app.post('/api/reviews', async (req, res) => {
+    try {
+      const reviews = sanitizeReviews(req.body?.reviews);
+
+      const { error } = await supabase
+        .from('settings')
+        .upsert([{ key: 'home_reviews', value: JSON.stringify(reviews) }]);
+
+      if (error) throw error;
+      res.json(reviews);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Failed to save reviews.' });
+    }
+  });
+
   app.get('/api/about', async (_req, res) => {
     try {
       const { data: headerImageSetting } = await supabase

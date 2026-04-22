@@ -210,20 +210,39 @@ async function startServer() {
 
   app.get('/api/about', async (_req, res) => {
     try {
+      const { data: headerImageSetting } = await supabase
+        .from('settings')
+        .select('value')
+        .eq('key', 'about_header_image_url')
+        .maybeSingle();
+
       const { data, error } = await supabase.from('about_content').select('*').maybeSingle();
 
       if (error) {
         if (error.code === '42P01') {
-          return res.json({ title: 'About Me', description: '', diplomas: [] });
+          return res.json({
+            title: 'About Me',
+            description: '',
+            diplomas: [],
+            header_image_url: headerImageSetting?.value || null,
+          });
         }
         throw error;
       }
 
       if (!data) {
-        return res.json({ title: 'About Me', description: '', diplomas: [] });
+        return res.json({
+          title: 'About Me',
+          description: '',
+          diplomas: [],
+          header_image_url: headerImageSetting?.value || null,
+        });
       }
 
-      res.json(data);
+      res.json({
+        ...data,
+        header_image_url: headerImageSetting?.value || data?.header_image_url || null,
+      });
     } catch (error: any) {
       res.status(500).json({ error: error.message || 'Internal Server Error' });
     }
@@ -231,11 +250,17 @@ async function startServer() {
 
   app.post('/api/about', async (req, res) => {
     try {
-      const payload = { ...req.body, id: 1 };
+      const { header_image_url, ...aboutPayload } = req.body || {};
+      const payload = { ...aboutPayload, id: 1 };
+
+      if (typeof header_image_url === 'string') {
+        await supabase.from('settings').upsert([{ key: 'about_header_image_url', value: header_image_url }]);
+      }
+
       const { data, error } = await supabase.from('about_content').upsert([payload]).select().maybeSingle();
 
       if (error) throw error;
-      res.json(data);
+      res.json({ ...data, header_image_url: header_image_url || null });
     } catch (error: any) {
       res.status(500).json({ error: error.message || 'Internal Server Error' });
     }

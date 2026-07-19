@@ -21,7 +21,9 @@ curl http://localhost:3001/health
 - `PORT` (default: `3001`)
 - `SUPABASE_URL` (required)
 - `SUPABASE_ANON_KEY` (required)
-- `RESEND_API_KEY` (optional, for confirmation emails)
+- `RESEND_API_KEY` (required if booking emails are enabled)
+- `RESEND_FROM_EMAIL` (required for email delivery; use a verified Resend sender, e.g. `Gio Therapies <bookings@yourdomain.com>`)
+- `BOOKING_NOTIFICATION_EMAIL` (optional but recommended; receives new booking alerts)
 
 Compatibility fallbacks still supported:
 

@@ -9,6 +9,79 @@ dotenv.config();
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+type EmailResult = {
+  sent: boolean;
+  id?: string;
+  error?: string;
+};
+
+function escapeHtml(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function formatBookingDate(date: string): string {
+  const parsed = new Date(`${date}T12:00:00Z`);
+  return Number.isNaN(parsed.getTime())
+    ? date
+    : parsed.toLocaleDateString('en-GB', {
+        timeZone: 'UTC',
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long',
+        year: 'numeric',
+      });
+}
+
+function bookingDetailsHtml(booking: Record<string, any>): string {
+  return `
+    <div style="background:#fcfaf7;padding:20px;border-radius:16px;border:1px solid #eadfce;line-height:1.7">
+      <p style="margin:0"><strong>Service:</strong> ${escapeHtml(booking.service_title)}</p>
+      <p style="margin:0"><strong>Date:</strong> ${escapeHtml(formatBookingDate(booking.date))}</p>
+      <p style="margin:0"><strong>Time:</strong> ${escapeHtml(booking.time)}</p>
+      <p style="margin:0"><strong>Name:</strong> ${escapeHtml(booking.name)}</p>
+      <p style="margin:0"><strong>Email:</strong> ${escapeHtml(booking.email)}</p>
+      <p style="margin:0"><strong>Phone:</strong> ${escapeHtml(booking.phone)}</p>
+      ${booking.notes ? `<p style="margin:12px 0 0"><strong>Notes:</strong><br>${escapeHtml(booking.notes).replace(/\n/g, '<br>')}</p>` : ''}
+    </div>`;
+}
+
+async function sendBookingEmail(
+  resend: Resend | null,
+  from: string,
+  to: string | undefined,
+  subject: string,
+  html: string,
+  replyTo?: string,
+): Promise<EmailResult> {
+  if (!to) return { sent: false, error: 'Recipient email is not configured.' };
+  if (!resend || !from) return { sent: false, error: 'Email service is not configured.' };
+
+  try {
+    const result = await resend.emails.send({
+      from,
+      to: [to],
+      subject,
+      html,
+      ...(replyTo ? { replyTo } : {}),
+    });
+
+    if (result.error) {
+      console.error('Resend rejected booking email:', result.error);
+      return { sent: false, error: 'Email provider rejected the message.' };
+    }
+
+    return { sent: true, id: result.data?.id };
+  } catch (error: any) {
+    console.error('Booking email delivery failed:', error?.message || error);
+    return { sent: false, error: 'Email delivery failed.' };
+  }
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3001);
@@ -21,8 +94,12 @@ async function startServer() {
     process.env.SUPABASE_ANON_KEY ||
     process.env.VITE_SUPABASE_ANON_KEY ||
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const hasSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey);
+  const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+  const emailFrom = process.env.RESEND_FROM_EMAIL || '';
+  const bookingNotificationEmail = process.env.BOOKING_NOTIFICATION_EMAIL || process.env.ADMIN_EMAIL;
 
-  if (!supabaseUrl || !supabaseAnonKey) {
+  if (!hasSupabaseConfig) {
     console.error('CRITICAL: Supabase credentials missing in environment.');
   }
 
@@ -31,16 +108,94 @@ async function startServer() {
   app.use(cors());
   app.use(express.json());
 
+  app.use('/api', (_req, res, next) => {
+    if (!hasSupabaseConfig) {
+      return res.status(503).json({
+        error: 'Backend is missing SUPABASE_URL or SUPABASE_ANON_KEY',
+      });
+    }
+
+    next();
+  });
+
   app.get('/health', (_req, res) => {
     res.json({ ok: true, service: 'gio-therapies-backend-api' });
   });
 
   app.post('/api/bookings', async (req, res) => {
     try {
-      const { data, error } = await supabase.from('bookings').insert([req.body]).select().single();
+      const body = req.body || {};
+      const name = String(body.name || '').trim();
+      const email = String(body.email || '').trim().toLowerCase();
+      const phone = String(body.phone || '').trim();
+      const date = String(body.date || '').trim();
+      const time = String(body.time || '').trim();
+      const serviceId = String(body.service_id || '').trim();
+      const serviceTitle = String(body.service_title || '').trim();
+      const category = String(body.category || '').trim();
+      const notes = String(body.notes || '').trim().slice(0, 2000);
+
+      if (!name || !email || !phone || !date || !time || !serviceId || !serviceTitle) {
+        return res.status(400).json({ success: false, error: 'Please provide all required booking details.' });
+      }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ success: false, error: 'Please provide a valid email address.' });
+      }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(time)) {
+        return res.status(400).json({ success: false, error: 'Please provide a valid preferred date and time.' });
+      }
+
+      const bookingPayload = {
+        service_id: serviceId,
+        service_title: serviceTitle,
+        name,
+        email,
+        phone,
+        date,
+        time,
+        notes,
+        category,
+        status: 'pending',
+        created_at: new Date().toISOString(),
+      };
+
+      const { data, error } = await supabase.from('bookings').insert([bookingPayload]).select().single();
 
       if (error) throw error;
-      res.json({ success: true, id: data.id });
+
+      const bookingHtml = bookingDetailsHtml(data);
+      void Promise.all([
+        sendBookingEmail(
+          resend,
+          emailFrom,
+          bookingNotificationEmail,
+          `New booking request — ${name}`,
+          `<div style="font-family:Arial,sans-serif;color:#334155;max-width:640px;margin:auto"><h2>New Gio Therapies booking request</h2>${bookingHtml}<p style="margin-top:20px">Review and confirm this request in the admin panel.</p></div>`,
+          email,
+        ),
+        sendBookingEmail(
+          resend,
+          emailFrom,
+          email,
+          'We received your Gio Therapies request',
+          `<div style="font-family:Arial,sans-serif;color:#334155;max-width:640px;margin:auto"><h2>Request received</h2><p>Hello ${escapeHtml(name)},</p><p>We have received your request and will contact you personally to confirm availability.</p>${bookingHtml}<p style="margin-top:20px;color:#64748b">This is not yet a confirmed appointment.</p></div>`,
+        ),
+      ]).then(([internalEmail, customerEmail]) => {
+        console.log('Booking email results:', {
+          bookingId: data.id,
+          internalSent: internalEmail.sent,
+          customerSent: customerEmail.sent,
+        });
+      });
+
+      res.status(201).json({
+        success: true,
+        id: data.id,
+        email: {
+          configured: Boolean(resend && emailFrom),
+          queued: true,
+        },
+      });
     } catch (error: any) {
       res.status(500).json({
         success: false,
@@ -52,7 +207,13 @@ async function startServer() {
 
   app.get('/api/bookings', async (_req, res) => {
     try {
-      const { data, error } = await supabase.from('bookings').select('*').order('date', { ascending: false });
+      let { data, error } = await supabase.from('bookings').select('*').order('date', { ascending: false });
+
+      if (error && error.code === '42703') {
+        const fallback = await supabase.from('bookings').select('*');
+        data = fallback.data;
+        error = fallback.error;
+      }
 
       if (error) {
         if (error.code === '42P01') return res.json([]);
@@ -66,8 +227,25 @@ async function startServer() {
 
   app.patch('/api/bookings/:id', async (req, res) => {
     try {
-      const { status } = req.body;
+      const status = String(req.body?.status || '').toLowerCase();
       const { id } = req.params;
+
+      if (!['pending', 'confirmed', 'cancelled'].includes(status)) {
+        return res.status(400).json({ error: 'Unsupported booking status.' });
+      }
+
+      const { data: existingBooking, error: fetchError } = await supabase
+        .from('bookings')
+        .select('*')
+        .eq('id', id)
+        .maybeSingle();
+
+      if (fetchError) throw fetchError;
+      if (!existingBooking) return res.status(404).json({ error: 'Booking not found.' });
+
+      if (existingBooking.status === status) {
+        return res.json({ success: true, alreadyApplied: true, email: { sent: false, skipped: true } });
+      }
 
       const { data: booking, error: updateError } = await supabase
         .from('bookings')
@@ -78,33 +256,26 @@ async function startServer() {
 
       if (updateError) throw updateError;
 
+      let email: EmailResult = { sent: false, error: 'No status email required.' };
       if (status === 'confirmed') {
-        if (!process.env.RESEND_API_KEY) {
-          console.warn('Skipping email: RESEND_API_KEY is not set in environment variables.');
-        } else {
-          const resend = new Resend(process.env.RESEND_API_KEY);
-          await resend.emails.send({
-            from: 'Ritual Sanctuary <onboarding@resend.dev>',
-            to: [booking.email],
-            subject: 'Your Ritual Appointment is Confirmed 🌿',
-            html: `
-              <div style="font-family: sans-serif; color: #334155; line-height: 1.6; max-width: 600px; margin: 0 auto; padding: 40px; border: 1px solid #f1f5f9; border-radius: 24px;">
-                <h2 style="color: #92754d; font-weight: 300; font-size: 28px;">Ritual Confirmation</h2>
-                <p>Hello ${booking.name},</p>
-                <p>Your request for the <strong>${booking.service_title}</strong> has been confirmed by the sanctuary.</p>
-                <div style="background-color: #fcfaf7; padding: 24px; border-radius: 16px; margin: 30px 0; border: 1px solid #92754d20;">
-                  <h4 style="margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 2px; color: #92754d;">Appointment Details</h4>
-                  <p style="margin: 5px 0;"><strong>Date:</strong> ${new Date(booking.date).toLocaleDateString()}</p>
-                  <p style="margin: 5px 0;"><strong>Time:</strong> ${booking.time}</p>
-                  <p style="margin: 5px 0;"><strong>Location:</strong> Gio Therapies Sanctuary</p>
-                </div>
-              </div>
-            `,
-          });
-        }
+        email = await sendBookingEmail(
+          resend,
+          emailFrom,
+          booking.email,
+          'Your Gio Therapies appointment is confirmed',
+          `<div style="font-family:Arial,sans-serif;color:#334155;max-width:640px;margin:auto"><h2>Your appointment is confirmed</h2><p>Hello ${escapeHtml(booking.name)},</p><p>Your Gio Therapies request has been confirmed.</p>${bookingDetailsHtml(booking)}<p style="margin-top:20px;color:#64748b">If you need to reschedule, please reply to this email as soon as possible.</p></div>`,
+        );
+      } else if (status === 'cancelled') {
+        email = await sendBookingEmail(
+          resend,
+          emailFrom,
+          booking.email,
+          'Update on your Gio Therapies request',
+          `<div style="font-family:Arial,sans-serif;color:#334155;max-width:640px;margin:auto"><h2>Update on your request</h2><p>Hello ${escapeHtml(booking.name)},</p><p>Unfortunately, we are unable to confirm this request at the preferred time. Please reply to this email if you would like to discuss another option.</p>${bookingDetailsHtml(booking)}</div>`,
+        );
       }
 
-      res.json({ success: true });
+      res.json({ success: true, email });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -123,7 +294,13 @@ async function startServer() {
 
   app.get('/api/services', async (_req, res) => {
     try {
-      const { data, error } = await supabase.from('services').select('*').order('sort_order', { ascending: true });
+      let { data, error } = await supabase.from('services').select('*').order('sort_order', { ascending: true });
+
+      if (error && error.code === '42703') {
+        const fallback = await supabase.from('services').select('*');
+        data = fallback.data;
+        error = fallback.error;
+      }
 
       if (error) {
         if (error.code === '42P01') return res.json([]);

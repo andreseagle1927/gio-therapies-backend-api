@@ -21,8 +21,14 @@ curl http://localhost:3001/health
 - `PORT` (default: `3001`)
 - `SUPABASE_URL` (required)
 - `SUPABASE_ANON_KEY` (required)
-- `RESEND_API_KEY` (required if booking emails are enabled)
-- `RESEND_FROM_EMAIL` (required for email delivery; use a verified Resend sender, e.g. `Gio Therapies <bookings@yourdomain.com>`)
+- `RESEND_API_KEY` (recommended if booking emails are enabled)
+- `RESEND_FROM_EMAIL` (required for Resend delivery; use a verified sender, e.g. `Gio Therapies <bookings@yourdomain.com>`)
+- `SMTP_HOST` (fallback option if Resend is not configured)
+- `SMTP_PORT` (default: `587`)
+- `SMTP_SECURE` (`true` for implicit TLS, usually port `465`)
+- `SMTP_USER` (required when the SMTP relay needs authentication)
+- `SMTP_PASS` (required when the SMTP relay needs authentication)
+- `SMTP_FROM_EMAIL` (required for SMTP delivery, e.g. `Gio Therapies <bookings@yourdomain.com>`)
 - `BOOKING_NOTIFICATION_EMAIL` (optional but recommended; receives new booking alerts)
 
 Compatibility fallbacks still supported:

@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 import { Resend } from 'resend';
+import nodemailer, { type Transporter } from 'nodemailer';
 import dotenv from 'dotenv';
 import multer from 'multer';
 
@@ -13,6 +14,16 @@ type EmailResult = {
   sent: boolean;
   id?: string;
   error?: string;
+};
+
+type EmailAttachment = {
+  filename: string;
+  content: string;
+};
+
+type EmailProvider = {
+  resend: Resend | null;
+  smtp: Transporter | null;
 };
 
 function escapeHtml(value: unknown): string {
@@ -79,33 +90,51 @@ function bookingDetailsHtml(booking: Record<string, any>): string {
 }
 
 async function sendBookingEmail(
-  resend: Resend | null,
+  provider: EmailProvider,
   from: string,
   to: string | undefined,
   subject: string,
   html: string,
   replyTo?: string,
-  attachments?: Array<{ filename: string; content: string }>,
+  attachments?: EmailAttachment[],
 ): Promise<EmailResult> {
   if (!to) return { sent: false, error: 'Recipient email is not configured.' };
-  if (!resend || !from) return { sent: false, error: 'Email service is not configured.' };
+  if (!from || (!provider.resend && !provider.smtp)) return { sent: false, error: 'Email service is not configured.' };
 
   try {
-    const result = await resend.emails.send({
+    if (provider.resend) {
+      const result = await provider.resend.emails.send({
+        from,
+        to: [to],
+        subject,
+        html,
+        ...(replyTo ? { replyTo } : {}),
+        ...(attachments?.length ? { attachments } : {}),
+      });
+
+      if (result.error) {
+        console.error('Resend rejected booking email:', result.error);
+        return { sent: false, error: 'Email provider rejected the message.' };
+      }
+
+      return { sent: true, id: result.data?.id };
+    }
+
+    const result = await provider.smtp!.sendMail({
       from,
-      to: [to],
+      to,
       subject,
       html,
       ...(replyTo ? { replyTo } : {}),
-      ...(attachments?.length ? { attachments } : {}),
+      ...(attachments?.length
+        ? { attachments: attachments.map((attachment) => ({
+          filename: attachment.filename,
+          content: Buffer.from(attachment.content, 'base64'),
+        })) }
+        : {}),
     });
 
-    if (result.error) {
-      console.error('Resend rejected booking email:', result.error);
-      return { sent: false, error: 'Email provider rejected the message.' };
-    }
-
-    return { sent: true, id: result.data?.id };
+    return { sent: true, id: result.messageId };
   } catch (error: any) {
     console.error('Booking email delivery failed:', error?.message || error);
     return { sent: false, error: 'Email delivery failed.' };
@@ -126,7 +155,21 @@ async function startServer() {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
   const hasSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey);
   const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
-  const emailFrom = process.env.RESEND_FROM_EMAIL || '';
+  const smtp = process.env.SMTP_HOST
+    ? nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || Number(process.env.SMTP_PORT) === 465,
+      auth: process.env.SMTP_USER || process.env.SMTP_PASS
+        ? {
+          user: process.env.SMTP_USER || '',
+          pass: process.env.SMTP_PASS || '',
+        }
+        : undefined,
+    })
+    : null;
+  const emailProvider = { resend, smtp };
+  const emailFrom = process.env.RESEND_FROM_EMAIL || process.env.SMTP_FROM_EMAIL || '';
   const environmentBookingNotificationEmail = process.env.BOOKING_NOTIFICATION_EMAIL || process.env.ADMIN_EMAIL;
 
   if (!hasSupabaseConfig) {
@@ -242,7 +285,7 @@ async function startServer() {
       const spreadsheet = createBookingCsv(data, intake);
       void Promise.all([
         sendBookingEmail(
-          resend,
+          emailProvider,
           emailFrom,
           notificationEmail,
           `New booking request — ${name}`,
@@ -254,7 +297,7 @@ async function startServer() {
           }],
         ),
         sendBookingEmail(
-          resend,
+          emailProvider,
           emailFrom,
           email,
           'We received your Gio Therapies request',
@@ -272,7 +315,7 @@ async function startServer() {
         success: true,
         id: data.id,
         email: {
-          configured: Boolean(resend && emailFrom && notificationEmail),
+          configured: Boolean((emailProvider.resend || emailProvider.smtp) && emailFrom && notificationEmail),
           queued: true,
         },
       });
@@ -339,7 +382,7 @@ async function startServer() {
       let email: EmailResult = { sent: false, error: 'No status email required.' };
       if (status === 'confirmed') {
         email = await sendBookingEmail(
-          resend,
+          emailProvider,
           emailFrom,
           booking.email,
           'Your Gio Therapies appointment is confirmed',
@@ -347,7 +390,7 @@ async function startServer() {
         );
       } else if (status === 'cancelled') {
         email = await sendBookingEmail(
-          resend,
+          emailProvider,
           emailFrom,
           booking.email,
           'Update on your Gio Therapies request',
@@ -502,7 +545,7 @@ async function startServer() {
       if (!await requireAdminSession(req, res)) return;
       const notificationEmail = await getBookingNotificationEmail();
       const result = await sendBookingEmail(
-        resend,
+        emailProvider,
         emailFrom,
         notificationEmail,
         'Gio Therapies notification test',

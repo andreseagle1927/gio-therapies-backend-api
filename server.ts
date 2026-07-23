@@ -163,7 +163,19 @@ async function startServer() {
     return String(environmentBookingNotificationEmail || '').trim();
   }
 
-  app.use(cors());
+  app.use(cors({
+    origin: (origin, callback) => {
+      const allowedOrigins = new Set([
+        'https://giotherapies.uk',
+        'https://www.giotherapies.uk',
+        'http://localhost:3000',
+        'http://localhost:3100',
+      ]);
+      callback(null, !origin || allowedOrigins.has(origin));
+    },
+    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  }));
   app.use(express.json());
 
   app.use('/api', (_req, res, next) => {

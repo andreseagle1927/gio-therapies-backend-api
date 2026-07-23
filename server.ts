@@ -37,6 +37,34 @@ function formatBookingDate(date: string): string {
       });
 }
 
+function csvCell(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  const text = Array.isArray(value) || (typeof value === 'object' && value !== null)
+    ? JSON.stringify(value)
+    : String(value);
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function createBookingCsv(booking: Record<string, unknown>, intake: Record<string, unknown>): string {
+  const rows: Array<[string, unknown]> = [['Field', 'Value']];
+  Object.entries(booking).forEach(([key, value]) => rows.push([key, value]));
+  Object.entries(intake).forEach(([key, value]) => rows.push([`intake.${key}`, value]));
+  return rows.map(([key, value]) => `${csvCell(key)},${csvCell(value)}`).join('\r\n');
+}
+
+function consultationSummary(intake: Record<string, unknown>): string {
+  return Object.entries(intake)
+    .filter(([key]) => !key.startsWith('consent_to_'))
+    .map(([key, value]) => {
+      const formatted = Array.isArray(value)
+        ? value.map((item) => typeof item === 'object' && item !== null ? JSON.stringify(item) : String(item)).join(', ')
+        : typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value ?? '');
+      return formatted ? `${key}: ${formatted}` : '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
 function bookingDetailsHtml(booking: Record<string, any>): string {
   return `
     <div style="background:#fcfaf7;padding:20px;border-radius:16px;border:1px solid #eadfce;line-height:1.7">
@@ -57,6 +85,7 @@ async function sendBookingEmail(
   subject: string,
   html: string,
   replyTo?: string,
+  attachments?: Array<{ filename: string; content: string }>,
 ): Promise<EmailResult> {
   if (!to) return { sent: false, error: 'Recipient email is not configured.' };
   if (!resend || !from) return { sent: false, error: 'Email service is not configured.' };
@@ -68,6 +97,7 @@ async function sendBookingEmail(
       subject,
       html,
       ...(replyTo ? { replyTo } : {}),
+      ...(attachments?.length ? { attachments } : {}),
     });
 
     if (result.error) {
@@ -97,13 +127,41 @@ async function startServer() {
   const hasSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey);
   const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
   const emailFrom = process.env.RESEND_FROM_EMAIL || '';
-  const bookingNotificationEmail = process.env.BOOKING_NOTIFICATION_EMAIL || process.env.ADMIN_EMAIL;
+  const environmentBookingNotificationEmail = process.env.BOOKING_NOTIFICATION_EMAIL || process.env.ADMIN_EMAIL;
 
   if (!hasSupabaseConfig) {
     console.error('CRITICAL: Supabase credentials missing in environment.');
   }
 
   const supabase = createClient(supabaseUrl || '', supabaseAnonKey || '');
+
+  async function requireAdminSession(req: express.Request, res: express.Response): Promise<boolean> {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '').trim();
+    if (!token) {
+      res.status(401).json({ error: 'Admin authentication is required.' });
+      return false;
+    }
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data.user) {
+      res.status(401).json({ error: 'Admin authentication is invalid or expired.' });
+      return false;
+    }
+    return true;
+  }
+
+  async function getBookingNotificationEmail(): Promise<string> {
+    try {
+      const { data, error } = await supabase
+        .from('settings')
+        .select('value')
+        .eq('key', 'booking_notification_email')
+        .maybeSingle();
+      if (!error && String(data?.value || '').trim()) return String(data?.value).trim();
+    } catch (error) {
+      console.warn('Could not read saved booking notification email.', error);
+    }
+    return String(environmentBookingNotificationEmail || '').trim();
+  }
 
   app.use(cors());
   app.use(express.json());
@@ -134,6 +192,9 @@ async function startServer() {
       const serviceTitle = String(body.service_title || '').trim();
       const category = String(body.category || '').trim();
       const notes = String(body.notes || '').trim().slice(0, 2000);
+      const intake = body.intake && typeof body.intake === 'object' ? body.intake as Record<string, unknown> : {};
+      const intakeText = consultationSummary(intake);
+      const storedNotes = [notes, intakeText ? `CONSULTATION INTAKE\n${intakeText}` : ''].filter(Boolean).join('\n\n').slice(0, 10000);
 
       if (!name || !email || !phone || !date || !time || !serviceId || !serviceTitle) {
         return res.status(400).json({ success: false, error: 'Please provide all required booking details.' });
@@ -153,7 +214,7 @@ async function startServer() {
         phone,
         date,
         time,
-        notes,
+        notes: storedNotes,
         category,
         status: 'pending',
         created_at: new Date().toISOString(),
@@ -162,16 +223,23 @@ async function startServer() {
       const { data, error } = await supabase.from('bookings').insert([bookingPayload]).select().single();
 
       if (error) throw error;
+      if (!data) throw new Error('Booking was not returned after insert.');
 
       const bookingHtml = bookingDetailsHtml(data);
+      const notificationEmail = await getBookingNotificationEmail();
+      const spreadsheet = createBookingCsv(data, intake);
       void Promise.all([
         sendBookingEmail(
           resend,
           emailFrom,
-          bookingNotificationEmail,
+          notificationEmail,
           `New booking request — ${name}`,
           `<div style="font-family:Arial,sans-serif;color:#334155;max-width:640px;margin:auto"><h2>New Gio Therapies booking request</h2>${bookingHtml}<p style="margin-top:20px">Review and confirm this request in the admin panel.</p></div>`,
           email,
+          [{
+            filename: `gio-booking-${date}.csv`,
+            content: Buffer.from(spreadsheet, 'utf8').toString('base64'),
+          }],
         ),
         sendBookingEmail(
           resend,
@@ -192,7 +260,7 @@ async function startServer() {
         success: true,
         id: data.id,
         email: {
-          configured: Boolean(resend && emailFrom),
+          configured: Boolean(resend && emailFrom && notificationEmail),
           queued: true,
         },
       });
@@ -380,6 +448,38 @@ async function startServer() {
 
       if (error) throw error;
       res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get('/api/notification-settings', async (req, res) => {
+    try {
+      if (!await requireAdminSession(req, res)) return;
+      const { data, error } = await supabase
+        .from('settings')
+        .select('value')
+        .eq('key', 'booking_notification_email')
+        .maybeSingle();
+      if (error) throw error;
+      res.json({ email: data?.value || '' });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post('/api/notification-settings', async (req, res) => {
+    try {
+      if (!await requireAdminSession(req, res)) return;
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: 'Enter a valid notification email address.' });
+      }
+      const { error } = await supabase
+        .from('settings')
+        .upsert([{ key: 'booking_notification_email', value: email }], { onConflict: 'key' });
+      if (error) throw error;
+      res.json({ success: true, email });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

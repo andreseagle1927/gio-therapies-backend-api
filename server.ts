@@ -462,7 +462,7 @@ async function startServer() {
         .eq('key', 'booking_notification_email')
         .maybeSingle();
       if (error) throw error;
-      res.json({ email: data?.value || '' });
+      res.json({ email: data?.value || environmentBookingNotificationEmail || '' });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

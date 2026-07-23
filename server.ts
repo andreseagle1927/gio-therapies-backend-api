@@ -485,6 +485,24 @@ async function startServer() {
     }
   });
 
+  app.post('/api/notification-settings/test', async (req, res) => {
+    try {
+      if (!await requireAdminSession(req, res)) return;
+      const notificationEmail = await getBookingNotificationEmail();
+      const result = await sendBookingEmail(
+        resend,
+        emailFrom,
+        notificationEmail,
+        'Gio Therapies notification test',
+        '<div style="font-family:Arial,sans-serif;color:#334155;max-width:640px;margin:auto"><h2>Gio Therapies email connection test</h2><p>This is a test message from the admin notification settings.</p><p>New booking requests will be sent to this recipient with their consultation details attached.</p></div>',
+      );
+      if (!result.sent) return res.status(502).json({ error: result.error || 'The test email could not be sent.' });
+      res.json({ success: true, sent: true, email: notificationEmail, id: result.id });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'The test email could not be sent.' });
+    }
+  });
+
   const defaultReviews = [
     {
       id: 'default-review-1',
